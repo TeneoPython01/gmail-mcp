@@ -97,33 +97,57 @@ _BLOCK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             re.IGNORECASE,
         ),
     ),
-    (
-        "prompt injection attempt",
-        re.compile(
-            # Direct instruction-override phrases
-            r"(ignore\s+(all\s+)?(previous|prior|above)\s+instructions?"
-            r"|disregard\s+(all\s+)?(previous|prior|above|your)\s+instructions?"
-            r"|forget\s+(all\s+)?(previous|prior|above|your)(\s+\w+)?\s+instructions?"
-            r"|override\s+(all\s+)?(previous|prior|above|your)\s+instructions?"
-            # Persona / role hijacking
-            r"|you\s+are\s+now\s+(a|an)\s+\w+"
-            r"|act\s+as\s+(a|an)\s+\w+"
-            r"|pretend\s+(you\s+are|to\s+be)\s+(a|an)\s+\w+"
-            r"|your\s+new\s+(role|persona|identity)\s+is"
-            r"|from\s+now\s+on\s+(you|your)"
-            # System-prompt injection markers
-            r"|new\s+system\s+prompt\s*:"
-            r"|system\s+(message|prompt)\s*:"
-            r"|\[SYSTEM\]|\[INST\]|<<SYS>>|<\|system\|>"
-            r"|\[system\s+prompt\]"
-            # DAN / jailbreak keywords
-            r"|\bDAN\b.*(\byou\b|\bmode\b)"
-            r"|jailbreak\s+(mode|prompt|this)"
-            r")",
-            re.IGNORECASE,
-        ),
-    ),
 ]
+
+# Prompt-injection sub-patterns, each individually named for easier debugging.
+_PROMPT_INJECTION_INSTRUCTION_OVERRIDE = re.compile(
+    r"(ignore\s+(all\s+)?(previous|prior|above)\s+instructions?"
+    r"|disregard\s+(all\s+)?(previous|prior|above|your)\s+instructions?"
+    r"|forget\s+(all\s+)?(previous|prior|above|your)(\s+\w+)?\s+instructions?"
+    r"|override\s+(all\s+)?(previous|prior|above|your)\s+instructions?)",
+    re.IGNORECASE,
+)
+
+_PROMPT_INJECTION_PERSONA_HIJACK = re.compile(
+    r"(you\s+are\s+now\s+(a|an)\s+\w+"
+    r"|act\s+as\s+(a|an)\s+\w+"
+    r"|pretend\s+(you\s+are|to\s+be)\s+(a|an)\s+\w+"
+    r"|your\s+new\s+(role|persona|identity)\s+is"
+    r"|from\s+now\s+on\s+(you|your))",
+    re.IGNORECASE,
+)
+
+_PROMPT_INJECTION_SYSTEM_MARKERS = re.compile(
+    r"(new\s+system\s+prompt\s*:"
+    r"|system\s+(message|prompt)\s*:"
+    r"|\[SYSTEM\]|\[INST\]|<<SYS>>|<\|system\|>"
+    r"|\[system\s+prompt\])",
+    re.IGNORECASE,
+)
+
+_PROMPT_INJECTION_JAILBREAK = re.compile(
+    r"(\bDAN\b.*(\byou\b|\bmode\b)"
+    r"|jailbreak\s+(mode|prompt|this))",
+    re.IGNORECASE,
+)
+
+# Consolidated list entry for _BLOCK_PATTERNS: a single logical entry whose
+# pattern fires when *any* of the sub-patterns above matches.
+_PROMPT_INJECTION_COMBINED = re.compile(
+    r"(?:"
+    + _PROMPT_INJECTION_INSTRUCTION_OVERRIDE.pattern
+    + r"|"
+    + _PROMPT_INJECTION_PERSONA_HIJACK.pattern
+    + r"|"
+    + _PROMPT_INJECTION_SYSTEM_MARKERS.pattern
+    + r"|"
+    + _PROMPT_INJECTION_JAILBREAK.pattern
+    + r")",
+    re.IGNORECASE,
+)
+
+_BLOCK_PATTERNS.append(("prompt injection attempt", _PROMPT_INJECTION_COMBINED))
+
 
 # Patterns whose matched text is REDACTED in-place (replaced with a placeholder).
 _REDACT_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [

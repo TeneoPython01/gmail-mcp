@@ -454,18 +454,19 @@ def confirm_action(action_id: str) -> dict:
         return client.send_email(**params)
     if tool_name == "reply_to_email":
         return client.reply_to_email(**params)
-    if tool_name == "mark_as_read":
-        client.mark_as_read(params["email_id"])
-        return {"status": "ok", "email_id": params["email_id"], "action": "marked_as_read"}
-    if tool_name == "mark_as_unread":
-        client.mark_as_unread(params["email_id"])
-        return {"status": "ok", "email_id": params["email_id"], "action": "marked_as_unread"}
-    if tool_name == "archive_email":
-        client.archive_email(params["email_id"])
-        return {"status": "ok", "email_id": params["email_id"], "action": "archived"}
-    if tool_name == "trash_email":
-        client.trash_email(params["email_id"])
-        return {"status": "ok", "email_id": params["email_id"], "action": "trashed"}
+
+    # Label-modifying / state-changing single-message operations share the
+    # same response shape: {status, email_id, action}.
+    _LABEL_OPS: dict[str, tuple[Any, str]] = {
+        "mark_as_read":   (client.mark_as_read,   "marked_as_read"),
+        "mark_as_unread": (client.mark_as_unread, "marked_as_unread"),
+        "archive_email":  (client.archive_email,  "archived"),
+        "trash_email":    (client.trash_email,    "trashed"),
+    }
+    if tool_name in _LABEL_OPS:
+        method, action_label = _LABEL_OPS[tool_name]
+        method(params["email_id"])
+        return {"status": "ok", "email_id": params["email_id"], "action": action_label}
 
     return {"error": f"Unknown pending action type: '{tool_name}'."}
 
