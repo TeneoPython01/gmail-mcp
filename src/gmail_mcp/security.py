@@ -11,6 +11,7 @@ Patterns covered:
   - Credit / debit card numbers (Luhn-valid 13–19 digit sequences)
   - Bank account and routing numbers
   - API keys, bearer tokens, private keys / certificates
+  - Prompt-injection attempts (instruction overrides, persona hijacking, jailbreaks)
   - Other Sensitive Personal Information (SPI) markers
 
 Attachment filtering:
@@ -93,6 +94,32 @@ _BLOCK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         "private key / certificate material",
         re.compile(
             r"-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----|-----BEGIN\s+CERTIFICATE-----",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "prompt injection attempt",
+        re.compile(
+            # Direct instruction-override phrases
+            r"(ignore\s+(all\s+)?(previous|prior|above)\s+instructions?"
+            r"|disregard\s+(all\s+)?(previous|prior|above|your)\s+instructions?"
+            r"|forget\s+(all\s+)?(previous|prior|above|your)(\s+\w+)?\s+instructions?"
+            r"|override\s+(all\s+)?(previous|prior|above|your)\s+instructions?"
+            # Persona / role hijacking
+            r"|you\s+are\s+now\s+(a|an)\s+\w+"
+            r"|act\s+as\s+(a|an)\s+\w+"
+            r"|pretend\s+(you\s+are|to\s+be)\s+(a|an)\s+\w+"
+            r"|your\s+new\s+(role|persona|identity)\s+is"
+            r"|from\s+now\s+on\s+(you|your)"
+            # System-prompt injection markers
+            r"|new\s+system\s+prompt\s*:"
+            r"|system\s+(message|prompt)\s*:"
+            r"|\[SYSTEM\]|\[INST\]|<<SYS>>|<\|system\|>"
+            r"|\[system\s+prompt\]"
+            # DAN / jailbreak keywords
+            r"|\bDAN\b.*(\byou\b|\bmode\b)"
+            r"|jailbreak\s+(mode|prompt|this)"
+            r")",
             re.IGNORECASE,
         ),
     ),
