@@ -274,7 +274,9 @@ def list_emails(
         carrying a restricted label are blocked outright.
     """
     params: dict[str, Any] = {
-        "max_results": max_results, "query": query, "label": label,
+        "max_results": max_results,
+        "query": query,
+        "label": label,
         "metadata_only": metadata_only,
     }
     client = _get_client()

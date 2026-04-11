@@ -126,7 +126,9 @@ class AuditLogger:
             self._prev_hash = hashlib.sha256(line.encode()).hexdigest()
             self._seq += 1
             try:
-                os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
+                parent_dir = os.path.dirname(os.path.abspath(self._path))
+                if parent_dir:
+                    os.makedirs(parent_dir, exist_ok=True)
                 with open(self._path, "a", encoding="utf-8") as fh:
                     fh.write(line + "\n")
             except OSError:

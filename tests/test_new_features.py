@@ -827,7 +827,11 @@ class TestCustomPatternHotReload:
 
     def test_custom_block_pattern_blocks_text(self, tmp_path):
         yaml_file = str(tmp_path / "patterns.yaml")
-        self._write_yaml(yaml_file, "block_patterns:\n  - name: employee ID\n    pattern: 'EMP-\\d{6}'\n")
+        self._write_yaml(yaml_file, (
+            "block_patterns:\n"
+            "  - name: employee ID\n"
+            "    pattern: 'EMP-\\d{6}'\n"
+        ))
         with patch.dict(os.environ, {"GMAIL_PATTERNS_FILE": yaml_file}):
             from gmail_mcp.security import reset_custom_patterns
             reset_custom_patterns()
@@ -838,10 +842,12 @@ class TestCustomPatternHotReload:
     def test_custom_redact_pattern_redacts_text(self, tmp_path):
         from gmail_mcp.security import redact_text, reset_custom_patterns
         yaml_file = str(tmp_path / "patterns.yaml")
-        self._write_yaml(
-            yaml_file,
-            "redact_patterns:\n  - name: account number\n    pattern: 'ACC-\\d{8}'\n    placeholder: '[ACCOUNT REDACTED]'\n",
-        )
+        self._write_yaml(yaml_file, (
+            "redact_patterns:\n"
+            "  - name: account number\n"
+            "    pattern: 'ACC-\\d{8}'\n"
+            "    placeholder: '[ACCOUNT REDACTED]'\n"
+        ))
         with patch.dict(os.environ, {"GMAIL_PATTERNS_FILE": yaml_file}):
             reset_custom_patterns()
             result = redact_text("Your ACC-12345678 has been updated.")
@@ -862,7 +868,11 @@ class TestCustomPatternHotReload:
         from gmail_mcp.security import reset_custom_patterns
         yaml_file = str(tmp_path / "patterns.yaml")
         # First write: block EMP-XXXXXX
-        self._write_yaml(yaml_file, "block_patterns:\n  - name: emp1\n    pattern: 'EMP-\\d{6}'\n")
+        self._write_yaml(yaml_file, (
+            "block_patterns:\n"
+            "  - name: emp1\n"
+            "    pattern: 'EMP-\\d{6}'\n"
+        ))
         with patch.dict(os.environ, {"GMAIL_PATTERNS_FILE": yaml_file}):
             reset_custom_patterns()
             r1 = scan_text("EMP-111111 joined")
@@ -870,7 +880,11 @@ class TestCustomPatternHotReload:
 
         # Update file with a different pattern (ensure mtime changes)
         time.sleep(0.05)
-        self._write_yaml(yaml_file, "block_patterns:\n  - name: dept code\n    pattern: 'DEPT-\\d{4}'\n")
+        self._write_yaml(yaml_file, (
+            "block_patterns:\n"
+            "  - name: dept code\n"
+            "    pattern: 'DEPT-\\d{4}'\n"
+        ))
         with patch.dict(os.environ, {"GMAIL_PATTERNS_FILE": yaml_file}):
             r2 = scan_text("EMP-111111 joined")  # old pattern no longer applies
             r3 = scan_text("DEPT-9999 is restricted")  # new pattern applies
