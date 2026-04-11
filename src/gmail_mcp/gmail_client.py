@@ -3,6 +3,11 @@
 This module wraps the Google Gmail API into simple Python methods.  All email
 content passes through the security filter in :mod:`gmail_mcp.security` before
 being returned, so the LLM never sees raw sensitive data.
+
+Attachment handling:
+  Text is extracted from plain-text, PDF, and DOCX attachments and scanned by
+  the same security filter used for email bodies.  Attachments whose text
+  cannot be extracted (e.g. images) are included with metadata only.
 """
 
 from __future__ import annotations
@@ -10,6 +15,8 @@ from __future__ import annotations
 import base64
 import email as _email_lib
 import email.utils
+import io
+import logging
 import re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -20,6 +27,33 @@ from googleapiclient.errors import HttpError
 
 from .auth import get_credentials
 from .security import FilteredEmail, filter_email
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Optional attachment-parsing libraries (graceful degradation if absent)
+# ---------------------------------------------------------------------------
+
+try:
+    from pdfminer.high_level import extract_text as _pdf_extract_text  # type: ignore[import]
+    _PDFMINER_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PDFMINER_AVAILABLE = False
+
+try:
+    import docx as _docx  # type: ignore[import]
+    _DOCX_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _DOCX_AVAILABLE = False
+
+# MIME types that are structural/body parts, not file attachments.
+_NON_ATTACHMENT_MIME_TYPES: frozenset[str] = frozenset({
+    "text/plain",
+    "text/html",
+    "multipart/mixed",
+    "multipart/alternative",
+    "multipart/related",
+})
 
 
 class GmailClient:
@@ -74,6 +108,137 @@ class GmailClient:
             if h.get("name", "").lower() == name.lower():
                 return h.get("value", "")
         return ""
+
+    # ------------------------------------------------------------------
+    # Attachment helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _collect_attachment_parts(payload: dict) -> list[dict]:
+        """Recursively collect attachment parts from a message payload."""
+        parts: list[dict] = []
+        filename = payload.get("filename", "")
+        mime_type = payload.get("mimeType", "")
+        body = payload.get("body", {})
+
+        # A part is considered an attachment when it has a filename or an
+        # explicit Content-Disposition of "attachment".
+        if filename or (
+            mime_type not in _NON_ATTACHMENT_MIME_TYPES
+            and body.get("attachmentId")
+        ):
+            parts.append(payload)
+
+        for sub in payload.get("parts", []):
+            parts.extend(GmailClient._collect_attachment_parts(sub))
+        return parts
+
+    def _fetch_attachment_bytes(
+        self, msg_id: str, part: dict, user_id: str
+    ) -> bytes:
+        """Return the raw bytes for a single attachment part."""
+        body = part.get("body", {})
+        attachment_id = body.get("attachmentId")
+
+        if attachment_id:
+            response = (
+                self._service.users()
+                .messages()
+                .attachments()
+                .get(userId=user_id, messageId=msg_id, id=attachment_id)
+                .execute()
+            )
+            data = response.get("data", "")
+        else:
+            data = body.get("data", "")
+
+        if not data:
+            return b""
+        return base64.urlsafe_b64decode(data)
+
+    @staticmethod
+    def _extract_text_from_bytes(mime_type: str, data: bytes) -> str:
+        """Extract plain text from attachment bytes.
+
+        Supports:
+          - ``text/plain`` – decoded directly as UTF-8.
+          - ``application/pdf`` – extracted via *pdfminer.six* (if installed).
+          - ``application/vnd.openxmlformats-officedocument.wordprocessingml.document``
+            (DOCX) – extracted via *python-docx* (if installed).
+
+        All other MIME types return an empty string.
+        """
+        if mime_type == "text/plain":
+            try:
+                return data.decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+
+        if mime_type == "application/pdf":
+            if not _PDFMINER_AVAILABLE:
+                logger.debug("pdfminer.six not installed; skipping PDF text extraction")
+                return ""
+            try:
+                return _pdf_extract_text(io.BytesIO(data)) or ""
+            except Exception as exc:
+                logger.debug("PDF text extraction failed: %s", exc)
+                return ""
+
+        if mime_type in (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/docx",
+        ):
+            if not _DOCX_AVAILABLE:
+                logger.debug("python-docx not installed; skipping DOCX text extraction")
+                return ""
+            try:
+                doc = _docx.Document(io.BytesIO(data))
+                return "\n".join(p.text for p in doc.paragraphs)
+            except Exception as exc:
+                logger.debug("DOCX text extraction failed: %s", exc)
+                return ""
+
+        return ""
+
+    def _parse_attachments(
+        self, msg_id: str, raw: dict, user_id: str
+    ) -> list[dict]:
+        """Return a list of attachment dicts with extracted text for *raw*.
+
+        Each dict contains:
+          ``filename``, ``mime_type``, ``size``, and ``content`` (extracted
+          text, or ``""`` if the type is not supported or extraction failed).
+        """
+        payload = raw.get("payload", {})
+        att_parts = self._collect_attachment_parts(payload)
+        attachments: list[dict] = []
+
+        for part in att_parts:
+            mime_type = part.get("mimeType", "")
+            filename = part.get("filename", "")
+            size = part.get("body", {}).get("size", 0)
+
+            try:
+                data_bytes = self._fetch_attachment_bytes(msg_id, part, user_id)
+            except Exception as exc:
+                logger.debug(
+                    "Could not fetch attachment '%s' (msg %s): %s",
+                    filename, msg_id, exc,
+                )
+                data_bytes = b""
+
+            content = self._extract_text_from_bytes(mime_type, data_bytes)
+
+            attachments.append(
+                {
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size": size,
+                    "content": content,
+                }
+            )
+
+        return attachments
 
     def _parse_message(self, raw: dict) -> dict:
         """Convert a raw Gmail API message into a normalised dict."""
@@ -138,6 +303,7 @@ class GmailClient:
         for msg in messages:
             raw = self._get_raw_message(msg["id"], user_id)
             parsed = self._parse_message(raw)
+            parsed["attachments"] = self._parse_attachments(msg["id"], raw, user_id)
             results.append(filter_email(parsed))
         return results
 
@@ -156,6 +322,7 @@ class GmailClient:
         except HttpError as exc:
             raise RuntimeError(f"Gmail API error: {exc}") from exc
         parsed = self._parse_message(raw)
+        parsed["attachments"] = self._parse_attachments(email_id, raw, user_id)
         return filter_email(parsed)
 
     def search_emails(

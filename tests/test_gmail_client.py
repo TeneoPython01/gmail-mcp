@@ -239,3 +239,177 @@ class TestManagement:
         mock_service.users().messages().trash().execute.return_value = {}
         client.trash_email("msg1")
         mock_service.users().messages().trash.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Attachment helpers
+# ---------------------------------------------------------------------------
+
+def _build_raw_message_with_attachment(
+    body_text: str = "Hello!",
+    att_filename: str = "doc.txt",
+    att_mime_type: str = "text/plain",
+    att_content: str = "attachment content",
+    use_attachment_id: bool = False,
+) -> dict:
+    """Return a raw Gmail message dict containing one attachment part."""
+    body_encoded = base64.urlsafe_b64encode(body_text.encode()).decode()
+    att_encoded = base64.urlsafe_b64encode(att_content.encode()).decode()
+    att_body: dict = {"size": len(att_content)}
+    if use_attachment_id:
+        att_body["attachmentId"] = "att_id_001"
+    else:
+        att_body["data"] = att_encoded
+    return {
+        "id": "msg1",
+        "threadId": "thread1",
+        "snippet": body_text[:50],
+        "labelIds": ["INBOX"],
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [
+                {"name": "Subject", "value": "Attachment Test"},
+                {"name": "From", "value": "alice@example.com"},
+                {"name": "To", "value": "bob@example.com"},
+                {"name": "Date", "value": "Mon, 1 Jan 2024 00:00:00 +0000"},
+                {"name": "Message-ID", "value": "<msg1@example.com>"},
+            ],
+            "body": {},
+            "parts": [
+                {
+                    "mimeType": "text/plain",
+                    "filename": "",
+                    "body": {"data": body_encoded},
+                    "parts": [],
+                },
+                {
+                    "mimeType": att_mime_type,
+                    "filename": att_filename,
+                    "body": att_body,
+                    "parts": [],
+                },
+            ],
+        },
+    }
+
+
+class TestAttachmentHelpers:
+    def test_collect_attachment_parts_finds_attachment(self, client):
+        raw = _build_raw_message_with_attachment()
+        parts = GmailClient._collect_attachment_parts(raw["payload"])
+        assert len(parts) == 1
+        assert parts[0]["filename"] == "doc.txt"
+
+    def test_collect_attachment_parts_empty_when_no_attachments(self, client):
+        raw = _build_raw_message(body_text="Plain message, no attachments")
+        parts = GmailClient._collect_attachment_parts(raw["payload"])
+        assert parts == []
+
+    def test_extract_text_from_bytes_plain(self, client):
+        data = b"Hello, world!"
+        result = GmailClient._extract_text_from_bytes("text/plain", data)
+        assert result == "Hello, world!"
+
+    def test_extract_text_from_bytes_unknown_type_returns_empty(self, client):
+        result = GmailClient._extract_text_from_bytes("image/png", b"\x89PNG\r\n")
+        assert result == ""
+
+    def test_fetch_attachment_bytes_inline_data(self, client, mock_service):
+        content = b"inline attachment data"
+        encoded = base64.urlsafe_b64encode(content).decode()
+        part = {"body": {"data": encoded}}
+        result = client._fetch_attachment_bytes("msg1", part, "me")
+        assert result == content
+
+    def test_fetch_attachment_bytes_via_api(self, client, mock_service):
+        content = b"api fetched attachment data"
+        encoded = base64.urlsafe_b64encode(content).decode()
+        mock_service.users().messages().attachments().get().execute.return_value = {
+            "data": encoded
+        }
+        part = {"body": {"attachmentId": "att_id_001"}}
+        result = client._fetch_attachment_bytes("msg1", part, "me")
+        assert result == content
+
+    def test_parse_attachments_returns_attachment_with_content(self, client, mock_service):
+        att_text = "This is a plain text attachment."
+        raw = _build_raw_message_with_attachment(att_content=att_text)
+        atts = client._parse_attachments("msg1", raw, "me")
+        assert len(atts) == 1
+        assert atts[0]["filename"] == "doc.txt"
+        assert atts[0]["content"] == att_text
+
+    def test_parse_attachments_fetches_via_api_when_attachment_id_present(
+        self, client, mock_service
+    ):
+        att_text = "Remote attachment text."
+        encoded = base64.urlsafe_b64encode(att_text.encode()).decode()
+        mock_service.users().messages().attachments().get().execute.return_value = {
+            "data": encoded
+        }
+        raw = _build_raw_message_with_attachment(
+            att_content=att_text, use_attachment_id=True
+        )
+        atts = client._parse_attachments("msg1", raw, "me")
+        assert len(atts) == 1
+        assert atts[0]["content"] == att_text
+
+
+class TestGetEmailWithAttachments:
+    def test_get_email_ssn_in_attachment_is_redacted(self, client, mock_service):
+        att_text = "Taxpayer SSN: 321-54-9876"
+        raw = _build_raw_message_with_attachment(
+            body_text="See attached.",
+            att_filename="tax.txt",
+            att_content=att_text,
+        )
+        mock_service.users().messages().get().execute.return_value = raw
+
+        fe = client.get_email("msg1")
+        assert fe.scan.level == SensitivityLevel.REDACTED
+        att = fe.data["attachments"][0]
+        assert "321-54-9876" not in att["content"]
+        assert "[SSN REDACTED]" in att["content"]
+
+    def test_get_email_private_key_in_attachment_is_blocked(self, client, mock_service):
+        att_text = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkq..."
+        raw = _build_raw_message_with_attachment(
+            body_text="Here is your key.",
+            att_filename="key.pem",
+            att_content=att_text,
+        )
+        mock_service.users().messages().get().execute.return_value = raw
+
+        fe = client.get_email("msg1")
+        assert fe.scan.level == SensitivityLevel.BLOCKED
+        att = fe.data["attachments"][0]
+        assert att.get("security_filtered") is True
+        assert "[ATTACHMENT BLOCKED" in att["content"]
+
+    def test_get_email_clean_attachment_passes_through(self, client, mock_service):
+        raw = _build_raw_message_with_attachment(
+            body_text="Please review.",
+            att_filename="agenda.txt",
+            att_content="Q3 planning agenda – discuss roadmap.",
+        )
+        mock_service.users().messages().get().execute.return_value = raw
+
+        fe = client.get_email("msg1")
+        assert fe.scan.level == SensitivityLevel.NONE
+        att = fe.data["attachments"][0]
+        assert att["content"] == "Q3 planning agenda – discuss roadmap."
+        assert not att.get("security_filtered")
+
+    def test_list_emails_with_ssn_in_attachment(self, client, mock_service):
+        att_text = "Credit card: 4111 1111 1111 1111"
+        raw = _build_raw_message_with_attachment(att_content=att_text)
+        mock_service.users().messages().list().execute.return_value = {
+            "messages": [{"id": "msg1"}]
+        }
+        mock_service.users().messages().get().execute.return_value = raw
+
+        results = client.list_emails()
+        assert len(results) == 1
+        fe = results[0]
+        assert fe.scan.level == SensitivityLevel.REDACTED
+        assert "[CARD NUMBER REDACTED]" in fe.data["attachments"][0]["content"]

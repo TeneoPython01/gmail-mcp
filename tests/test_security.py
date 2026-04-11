@@ -6,6 +6,7 @@ import pytest
 
 from gmail_mcp.security import (
     SensitivityLevel,
+    filter_attachment,
     filter_email,
     redact_text,
     scan_text,
@@ -273,3 +274,267 @@ class TestFilterEmail:
         email = _make_email(subject="Security alert: new sign-in", body="Was this you?")
         fe = filter_email(email)
         assert fe.scan.level == SensitivityLevel.BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# filter_attachment – attachment content filtering
+# ---------------------------------------------------------------------------
+
+def _make_attachment(**kwargs) -> dict:
+    defaults = {
+        "filename": "document.txt",
+        "mime_type": "text/plain",
+        "size": 100,
+        "content": "",
+    }
+    defaults.update(kwargs)
+    return defaults
+
+
+class TestFilterAttachment:
+    def test_clean_attachment_passes_through(self):
+        att = _make_attachment(content="Just a plain document with no secrets.")
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.NONE
+        assert fa.data["content"] == "Just a plain document with no secrets."
+        assert not fa.data.get("security_filtered")
+
+    def test_empty_content_passes_through(self):
+        att = _make_attachment(content="")
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.NONE
+
+    def test_no_content_key_passes_through(self):
+        att = {"filename": "image.png", "mime_type": "image/png", "size": 2048}
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.NONE
+
+    # Credential patterns → BLOCKED
+
+    def test_private_key_in_attachment_is_blocked(self):
+        att = _make_attachment(
+            filename="key.pem",
+            content="-----BEGIN RSA PRIVATE KEY-----\nMIIEow...",
+        )
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.BLOCKED
+        assert fa.data.get("security_filtered") is True
+        assert "[ATTACHMENT BLOCKED" in fa.data["content"]
+        assert isinstance(fa.data.get("security_reasons"), list)
+        assert len(fa.data["security_reasons"]) > 0
+
+    def test_password_reset_text_in_attachment_is_blocked(self):
+        att = _make_attachment(
+            filename="email_body.txt",
+            content="Please click here to reset your password.",
+        )
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.BLOCKED
+        assert fa.data.get("security_filtered") is True
+
+    def test_plaintext_password_in_attachment_is_blocked(self):
+        att = _make_attachment(
+            filename="creds.txt",
+            content="Your temporary password is: S3cr3tP@ss!",
+        )
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.BLOCKED
+
+    # PII patterns → REDACTED
+
+    def test_ssn_in_attachment_is_redacted(self):
+        att = _make_attachment(
+            filename="tax_form.txt",
+            content="Taxpayer SSN: 321-54-9876 – please verify.",
+        )
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.REDACTED
+        assert "321-54-9876" not in fa.data["content"]
+        assert "[SSN REDACTED]" in fa.data["content"]
+        assert fa.data.get("security_filtered") is True
+
+    def test_credit_card_in_attachment_is_redacted(self):
+        att = _make_attachment(
+            filename="invoice.txt",
+            content="Charge to card 4111 1111 1111 1111 for $99.",
+        )
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.REDACTED
+        assert "[CARD NUMBER REDACTED]" in fa.data["content"]
+
+    def test_bearer_token_in_attachment_is_redacted(self):
+        att = _make_attachment(
+            filename="config.txt",
+            content="Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        )
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.REDACTED
+        assert "[TOKEN REDACTED]" in fa.data["content"]
+
+    def test_aws_key_in_attachment_is_redacted(self):
+        att = _make_attachment(
+            filename="aws_config.txt",
+            content="Access key: AKIAIOSFODNN7EXAMPLE",
+        )
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.REDACTED
+        assert "AKIAIOSFODNN7EXAMPLE" not in fa.data["content"]
+        assert "[AWS KEY REDACTED]" in fa.data["content"]
+
+    def test_routing_number_in_attachment_is_redacted(self):
+        att = _make_attachment(
+            filename="bank_info.txt",
+            content="ABA routing: 021000021",
+        )
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.REDACTED
+        assert "[ROUTING NUMBER REDACTED]" in fa.data["content"]
+
+    def test_block_takes_priority_over_redact_in_attachment(self):
+        att = _make_attachment(
+            content="Reset your password. SSN: 123-45-6789.",
+        )
+        fa = filter_attachment(att)
+        assert fa.scan.level == SensitivityLevel.BLOCKED
+
+    def test_original_content_unchanged_on_clean(self):
+        original = "Meeting agenda: discuss Q3 targets."
+        att = _make_attachment(content=original)
+        fa = filter_attachment(att)
+        assert fa.data["content"] == original
+        assert fa.data.get("security_reasons") is None
+
+    def test_security_reasons_present_on_redact(self):
+        att = _make_attachment(content="SSN is 234-56-7890 here.")
+        fa = filter_attachment(att)
+        assert isinstance(fa.data.get("security_reasons"), list)
+        assert len(fa.data["security_reasons"]) > 0
+
+    def test_security_reasons_present_on_block(self):
+        att = _make_attachment(content="Your one-time password is 482910.")
+        fa = filter_attachment(att)
+        assert isinstance(fa.data.get("security_reasons"), list)
+        assert len(fa.data["security_reasons"]) > 0
+
+    def test_filename_and_mime_preserved_after_block(self):
+        att = _make_attachment(
+            filename="secret.txt",
+            mime_type="text/plain",
+            content="-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkq...",
+        )
+        fa = filter_attachment(att)
+        assert fa.data["filename"] == "secret.txt"
+        assert fa.data["mime_type"] == "text/plain"
+
+    def test_filename_and_mime_preserved_after_redact(self):
+        att = _make_attachment(
+            filename="data.csv",
+            mime_type="text/plain",
+            content="Row1, SSN 111-22-3333",
+        )
+        fa = filter_attachment(att)
+        assert fa.data["filename"] == "data.csv"
+        assert fa.data["mime_type"] == "text/plain"
+
+
+# ---------------------------------------------------------------------------
+# filter_email with attachments
+# ---------------------------------------------------------------------------
+
+class TestFilterEmailWithAttachments:
+    def test_email_with_clean_attachment_passes(self):
+        email = _make_email(
+            subject="Report",
+            body="Please see the attached report.",
+            attachments=[_make_attachment(content="Q3 results look good.")],
+        )
+        fe = filter_email(email)
+        assert fe.scan.level == SensitivityLevel.NONE
+        assert len(fe.data["attachments"]) == 1
+        assert fe.data["attachments"][0]["content"] == "Q3 results look good."
+
+    def test_email_with_ssn_in_attachment_is_redacted(self):
+        email = _make_email(
+            subject="Tax document",
+            body="See attached.",
+            attachments=[
+                _make_attachment(
+                    filename="tax.txt",
+                    content="Taxpayer SSN: 123-45-6789",
+                )
+            ],
+        )
+        fe = filter_email(email)
+        assert fe.scan.level == SensitivityLevel.REDACTED
+        att = fe.data["attachments"][0]
+        assert "123-45-6789" not in att["content"]
+        assert "[SSN REDACTED]" in att["content"]
+
+    def test_email_with_credential_in_attachment_raises_level(self):
+        email = _make_email(
+            subject="Keys",
+            body="Here are your keys.",
+            attachments=[
+                _make_attachment(
+                    filename="key.pem",
+                    content="-----BEGIN RSA PRIVATE KEY-----\nMIIEow...",
+                )
+            ],
+        )
+        fe = filter_email(email)
+        assert fe.scan.level == SensitivityLevel.BLOCKED
+        att = fe.data["attachments"][0]
+        assert att.get("security_filtered") is True
+
+    def test_email_body_blocked_ignores_attachment_level(self):
+        # When the email body itself is blocked, the whole email is blocked
+        # regardless of what attachments contain.
+        email = _make_email(
+            subject="Reset your password",
+            body="Click here to reset.",
+            attachments=[_make_attachment(content="Normal content.")],
+        )
+        fe = filter_email(email)
+        assert fe.scan.level == SensitivityLevel.BLOCKED
+
+    def test_email_with_no_attachments_key(self):
+        email = _make_email(subject="Hello", body="Hi there!")
+        fe = filter_email(email)
+        assert fe.scan.level == SensitivityLevel.NONE
+        # No attachments key in result when there are none
+        assert "attachments" not in fe.data or fe.data.get("attachments") == []
+
+    def test_email_with_multiple_attachments_all_filtered(self):
+        email = _make_email(
+            subject="Documents",
+            body="See attached files.",
+            attachments=[
+                _make_attachment(filename="safe.txt", content="Nothing sensitive."),
+                _make_attachment(filename="pii.txt", content="SSN: 234-56-7890"),
+                _make_attachment(
+                    filename="creds.txt",
+                    content="api_key = abcdefghijklmnopqrstuvwxyz12345678",
+                ),
+            ],
+        )
+        fe = filter_email(email)
+        assert fe.scan.level == SensitivityLevel.REDACTED
+        atts = fe.data["attachments"]
+        assert atts[0]["content"] == "Nothing sensitive."
+        assert "[SSN REDACTED]" in atts[1]["content"]
+        assert "[TOKEN REDACTED]" in atts[2]["content"]
+
+    def test_attachment_scan_reasons_propagated_to_email_scan(self):
+        email = _make_email(
+            subject="Data",
+            body="See attached.",
+            attachments=[
+                _make_attachment(
+                    filename="data.txt",
+                    content="Card: 4111 1111 1111 1111",
+                )
+            ],
+        )
+        fe = filter_email(email)
+        assert fe.scan.level == SensitivityLevel.REDACTED
+        assert any("data.txt" in r for r in fe.scan.reasons)

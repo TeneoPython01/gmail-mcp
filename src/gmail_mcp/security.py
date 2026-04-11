@@ -12,6 +12,10 @@ Patterns covered:
   - Bank account and routing numbers
   - API keys, bearer tokens, private keys / certificates
   - Other Sensitive Personal Information (SPI) markers
+
+Attachment filtering:
+  The same pattern engine is applied to extracted text from email attachments
+  (plain text, PDF, DOCX) to catch credentials, PII, or SPI embedded in files.
 """
 
 from __future__ import annotations
@@ -38,6 +42,12 @@ class ScanResult:
     """Result of scanning an email for sensitive content."""
     level: SensitivityLevel = SensitivityLevel.NONE
     reasons: list[str] = field(default_factory=list)
+
+
+class FilteredAttachment(NamedTuple):
+    """An attachment dict after security filtering has been applied."""
+    data: dict          # The (possibly-redacted) attachment fields.
+    scan: ScanResult    # What was found / redacted.
 
 
 class FilteredEmail(NamedTuple):
@@ -170,11 +180,67 @@ def redact_text(text: str) -> str:
     return text
 
 
+def filter_attachment(attachment: dict) -> FilteredAttachment:
+    """Apply security filtering to an attachment dict.
+
+    The *attachment* dict is expected to contain at least ``filename`` and
+    ``mime_type``, and optionally ``content`` with the extracted text of the
+    attachment.
+
+    Returns:
+        A :class:`FilteredAttachment` with the (possibly-redacted) attachment
+        data and a :class:`ScanResult` describing what was found.
+
+    Behaviour:
+        - If the extracted text contains a block-level pattern (credentials,
+          private keys, reset links) → the content is replaced with a security
+          notice.
+        - If the extracted text contains a redact-level pattern (SSN, credit
+          card, bearer token, AWS key, …) → those values are replaced in-place
+          and the attachment is returned with the redacted content.
+        - Attachments with no extractable text are returned unchanged.
+    """
+    content = attachment.get("content", "") or ""
+
+    if not content:
+        return FilteredAttachment(data=dict(attachment), scan=ScanResult())
+
+    scan = scan_text(content)
+
+    if scan.level == SensitivityLevel.BLOCKED:
+        filtered = dict(attachment)
+        filtered["content"] = (
+            "[ATTACHMENT BLOCKED: contains sensitive or credential information]\n"
+            f"Reason(s): {', '.join(scan.reasons)}"
+        )
+        filtered["security_filtered"] = True
+        filtered["security_reasons"] = scan.reasons
+        return FilteredAttachment(data=filtered, scan=scan)
+
+    redacted_content = redact_text(content)
+    reasons: list[str] = []
+    for reason, pattern, _ph in _REDACT_PATTERNS:
+        if pattern.search(content):
+            reasons.append(reason)
+
+    filtered = dict(attachment)
+    filtered["content"] = redacted_content
+    level = SensitivityLevel.REDACTED if reasons else SensitivityLevel.NONE
+    scan = ScanResult(level=level, reasons=reasons)
+    if reasons:
+        filtered["security_filtered"] = True
+        filtered["security_reasons"] = reasons
+    return FilteredAttachment(data=filtered, scan=scan)
+
+
 def filter_email(email: dict) -> FilteredEmail:
     """Apply security filtering to an email dict.
 
     The *email* dict is expected to contain at least some of these keys:
     ``subject``, ``body``, ``snippet``, ``from``, ``to``, ``cc``, ``bcc``.
+    An optional ``attachments`` key may hold a list of attachment dicts (each
+    with ``filename``, ``mime_type``, and optionally ``content``); each
+    attachment is independently scanned with :func:`filter_attachment`.
 
     Returns:
         A :class:`FilteredEmail` with the (possibly redacted) email data and a
@@ -186,6 +252,8 @@ def filter_email(email: dict) -> FilteredEmail:
         - If body / snippet / subject contains a block pattern → same.
         - If body / snippet contain redact-only patterns → those are replaced
           in-place and the modified email is returned.
+        - Each attachment is filtered independently: blocked attachment content
+          is replaced with a notice; PII/SPI values are redacted in-place.
     """
     subject = email.get("subject", "") or ""
     body = email.get("body", "") or ""
@@ -226,6 +294,37 @@ def filter_email(email: dict) -> FilteredEmail:
 
     level = SensitivityLevel.REDACTED if reasons else SensitivityLevel.NONE
     scan = ScanResult(level=level, reasons=reasons)
+
+    # ------------------------------------------------------------------
+    # 4. Filter attachments (credentials, PII, and SPI)
+    # ------------------------------------------------------------------
+    raw_attachments = email.get("attachments", [])
+    if raw_attachments:
+        filtered_attachments = []
+        for att in raw_attachments:
+            fa = filter_attachment(att)
+            filtered_attachments.append(fa.data)
+            # Propagate the worst attachment scan level to the email scan.
+            if fa.scan.level == SensitivityLevel.BLOCKED:
+                if scan.level != SensitivityLevel.BLOCKED:
+                    scan = ScanResult(
+                        level=SensitivityLevel.BLOCKED,
+                        reasons=scan.reasons + [
+                            f"attachment '{att.get('filename', 'unknown')}': "
+                            + ", ".join(fa.scan.reasons)
+                        ],
+                    )
+            elif fa.scan.level == SensitivityLevel.REDACTED:
+                if scan.level == SensitivityLevel.NONE:
+                    scan = ScanResult(level=SensitivityLevel.REDACTED, reasons=list(scan.reasons))
+                for r in fa.scan.reasons:
+                    att_reason = (
+                        f"attachment '{att.get('filename', 'unknown')}': {r}"
+                    )
+                    if att_reason not in scan.reasons:
+                        scan.reasons.append(att_reason)
+        filtered["attachments"] = filtered_attachments
+
     return FilteredEmail(data=filtered, scan=scan)
 
 
