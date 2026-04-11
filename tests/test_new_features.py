@@ -484,3 +484,530 @@ class TestConfirmationRequiredMode:
             result = srv.trash_email(email_id="abc123")
         mock_client.trash_email.assert_called_once_with("abc123")
         assert result.get("action") == "trashed"
+
+
+# ---------------------------------------------------------------------------
+# Feature 8 – Outbound email content scanning
+# ---------------------------------------------------------------------------
+
+class TestOutboundContentScanning:
+    """send_email and reply_to_email must block sensitive outbound bodies."""
+
+    def setup_method(self):
+        reset_config()
+        import gmail_mcp.server as srv
+        srv._client = None
+        srv._pending_actions.clear()
+
+    def teardown_method(self):
+        reset_config()
+        import gmail_mcp.server as srv
+        srv._client = None
+        srv._pending_actions.clear()
+
+    def test_clean_body_sends_normally(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_REQUIRE_CONFIRMATION", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            mock_client.send_email.return_value = {"id": "sent1", "thread_id": "t1"}
+            srv._client = mock_client
+            result = srv.send_email(
+                to="bob@example.com",
+                subject="Hello",
+                body="Just checking in, hope you're well!",
+            )
+        assert result.get("id") == "sent1"
+        mock_client.send_email.assert_called_once()
+
+    def test_send_email_blocked_on_ssn_in_body(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_REQUIRE_CONFIRMATION", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            srv._client = mock_client
+            result = srv.send_email(
+                to="bob@example.com",
+                subject="Info",
+                body="My SSN is 123-45-6789, please keep it safe.",
+            )
+        assert "error" in result
+        assert result.get("security_filtered") is True
+        mock_client.send_email.assert_not_called()
+
+    def test_send_email_blocked_on_api_key_in_body(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_REQUIRE_CONFIRMATION", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            srv._client = mock_client
+            result = srv.send_email(
+                to="bob@example.com",
+                subject="Keys",
+                body="Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6QUJDREVGR0g",
+            )
+        assert "error" in result
+        assert result.get("security_filtered") is True
+        mock_client.send_email.assert_not_called()
+
+    def test_send_email_blocked_on_password_reset_body(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_REQUIRE_CONFIRMATION", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            srv._client = mock_client
+            result = srv.send_email(
+                to="bob@example.com",
+                subject="FYI",
+                body="Click here to reset your password: https://example.com/reset?t=abc",
+            )
+        assert "error" in result
+        assert result.get("security_filtered") is True
+        mock_client.send_email.assert_not_called()
+
+    def test_reply_to_email_blocked_on_sensitive_body(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_REQUIRE_CONFIRMATION", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            srv._client = mock_client
+            result = srv.reply_to_email(
+                email_id="abc123",
+                body="Your card number is 4111 1111 1111 1111, please confirm.",
+            )
+        assert "error" in result
+        assert result.get("security_filtered") is True
+        mock_client.reply_to_email.assert_not_called()
+
+    def test_reply_to_email_clean_body_sends(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_REQUIRE_CONFIRMATION", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            mock_client.reply_to_email.return_value = {"id": "reply1", "thread_id": "t1"}
+            srv._client = mock_client
+            result = srv.reply_to_email(
+                email_id="abc123",
+                body="Thanks for your message, I'll follow up soon.",
+            )
+        assert result.get("id") == "reply1"
+        mock_client.reply_to_email.assert_called_once()
+
+    def test_confirm_action_blocks_sensitive_body(self):
+        """confirm_action must re-scan the body at execution time."""
+        import uuid as _uuid
+        import gmail_mcp.server as srv
+        # Bypass the initial outbound scan by directly inserting a pending action.
+        action_id = str(_uuid.uuid4())
+        srv._pending_actions[action_id] = {
+            "tool": "send_email",
+            "params": {
+                "to": "x@x.com",
+                "subject": "Hi",
+                "body": "Your temporary password is: S3cr3t!",
+                "cc": "",
+                "bcc": "",
+            },
+        }
+        mock_client = MagicMock()
+        srv._client = mock_client
+        result = srv.confirm_action(action_id)
+        assert "error" in result
+        assert result.get("security_filtered") is True
+        mock_client.send_email.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Feature 10 – Audit logging
+# ---------------------------------------------------------------------------
+
+class TestAuditLogging:
+    """AuditLogger writes tamper-evident JSONL entries."""
+
+    def setup_method(self):
+        from gmail_mcp.audit import reset_audit_logger
+        reset_audit_logger()
+        reset_config()
+
+    def teardown_method(self):
+        from gmail_mcp.audit import reset_audit_logger
+        reset_audit_logger()
+        reset_config()
+
+    def test_logger_disabled_when_no_env_var(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_AUDIT_LOG", None)
+            from gmail_mcp.audit import get_audit_logger, reset_audit_logger
+            reset_audit_logger()
+            assert get_audit_logger() is None
+
+    def test_logger_created_when_path_set(self, tmp_path):
+        log_file = str(tmp_path / "audit.jsonl")
+        from gmail_mcp.audit import get_audit_logger, reset_audit_logger
+        reset_audit_logger()
+        with patch.dict(os.environ, {"GMAIL_AUDIT_LOG": log_file}):
+            logger = get_audit_logger()
+        assert logger is not None
+
+    def test_log_writes_jsonl_entry(self, tmp_path):
+        import json as _json
+        from gmail_mcp.audit import AuditLogger
+        log_file = str(tmp_path / "audit.jsonl")
+        logger = AuditLogger(log_file)
+        logger.log("send_email", {"to": "bob@example.com", "body": "Hello there!"}, "ok")
+        with open(log_file, encoding="utf-8") as fh:
+            lines = [l.strip() for l in fh if l.strip()]
+        assert len(lines) == 1
+        entry = _json.loads(lines[0])
+        assert entry["tool"] == "send_email"
+        assert entry["result"] == "ok"
+        assert entry["seq"] == 0
+
+    def test_body_param_is_masked(self, tmp_path):
+        import json as _json
+        from gmail_mcp.audit import AuditLogger
+        log_file = str(tmp_path / "audit.jsonl")
+        logger = AuditLogger(log_file)
+        logger.log("send_email", {"to": "bob@example.com", "body": "Secret content here"}, "ok")
+        with open(log_file, encoding="utf-8") as fh:
+            entry = _json.loads(fh.readline())
+        body_val = entry["params"]["body"]
+        assert "Secret content here" not in body_val
+        assert "chars" in body_val
+
+    def test_sequence_numbers_increment(self, tmp_path):
+        import json as _json
+        from gmail_mcp.audit import AuditLogger
+        log_file = str(tmp_path / "audit.jsonl")
+        logger = AuditLogger(log_file)
+        logger.log("list_emails", {}, "ok")
+        logger.log("get_email", {"email_id": "abc"}, "ok")
+        logger.log("trash_email", {"email_id": "abc"}, "ok")
+        with open(log_file, encoding="utf-8") as fh:
+            entries = [_json.loads(l) for l in fh if l.strip()]
+        assert [e["seq"] for e in entries] == [0, 1, 2]
+
+    def test_prev_hash_forms_chain(self, tmp_path):
+        import hashlib
+        import json as _json
+        from gmail_mcp.audit import AuditLogger
+        log_file = str(tmp_path / "audit.jsonl")
+        logger = AuditLogger(log_file)
+        logger.log("list_emails", {}, "ok")
+        logger.log("get_email", {"email_id": "abc"}, "ok")
+        with open(log_file, encoding="utf-8") as fh:
+            lines = [l.rstrip("\n") for l in fh if l.strip()]
+        e0 = _json.loads(lines[0])
+        e1 = _json.loads(lines[1])
+        assert e1["prev_hash"] == hashlib.sha256(lines[0].encode()).hexdigest()
+        # Genesis hash is SHA-256 of empty bytes
+        assert e0["prev_hash"] == hashlib.sha256(b"").hexdigest()
+
+    def test_reasons_recorded(self, tmp_path):
+        import json as _json
+        from gmail_mcp.audit import AuditLogger
+        log_file = str(tmp_path / "audit.jsonl")
+        logger = AuditLogger(log_file)
+        logger.log("get_email", {"email_id": "x"}, "blocked", ["password reset / account recovery link"])
+        with open(log_file, encoding="utf-8") as fh:
+            entry = _json.loads(fh.readline())
+        assert "password reset" in entry["reasons"][0]
+
+    def test_resume_state_from_existing_log(self, tmp_path):
+        import json as _json
+        from gmail_mcp.audit import AuditLogger
+        log_file = str(tmp_path / "audit.jsonl")
+        logger1 = AuditLogger(log_file)
+        logger1.log("list_emails", {}, "ok")
+        logger1.log("get_email", {}, "ok")
+        # Create a new logger instance that reads the existing file.
+        logger2 = AuditLogger(log_file)
+        logger2.log("trash_email", {"email_id": "abc"}, "ok")
+        with open(log_file, encoding="utf-8") as fh:
+            entries = [_json.loads(l) for l in fh if l.strip()]
+        assert entries[-1]["seq"] == 2
+
+    def test_get_audit_logger_singleton(self, tmp_path):
+        log_file = str(tmp_path / "audit.jsonl")
+        from gmail_mcp.audit import get_audit_logger, reset_audit_logger
+        reset_audit_logger()
+        with patch.dict(os.environ, {"GMAIL_AUDIT_LOG": log_file}):
+            a = get_audit_logger()
+            b = get_audit_logger()
+        assert a is b
+
+
+# ---------------------------------------------------------------------------
+# Feature 13 – Email body truncation limit
+# ---------------------------------------------------------------------------
+
+class TestBodyTruncation:
+    """Bodies longer than GMAIL_MAX_BODY_CHARS are truncated."""
+
+    def setup_method(self):
+        reset_config()
+
+    def teardown_method(self):
+        reset_config()
+
+    def _truncate(self, body: str, limit: int) -> dict:
+        with patch.dict(os.environ, {"GMAIL_MAX_BODY_CHARS": str(limit)}):
+            reset_config()
+            import gmail_mcp.server as srv
+            email_data = {"id": "abc", "body": body}
+            return srv._apply_body_truncation(email_data)
+
+    def test_body_within_limit_unchanged(self):
+        body = "Hello world"
+        result = self._truncate(body, 100)
+        assert result["body"] == body
+        assert "body_truncated" not in result
+
+    def test_body_exceeding_limit_is_truncated(self):
+        body = "x" * 200
+        result = self._truncate(body, 100)
+        assert result["body"].startswith("x" * 100)
+        assert "TRUNCATED" in result["body"]
+        assert result.get("body_truncated") is True
+
+    def test_truncation_notice_contains_original_length(self):
+        body = "a" * 500
+        result = self._truncate(body, 200)
+        assert "500" in result["body"]
+        assert "200" in result["body"]
+
+    def test_zero_limit_means_no_truncation(self):
+        body = "x" * 10_000
+        with patch.dict(os.environ, {"GMAIL_MAX_BODY_CHARS": "0"}):
+            reset_config()
+            import gmail_mcp.server as srv
+            email_data = {"id": "abc", "body": body}
+            result = srv._apply_body_truncation(email_data)
+        assert result["body"] == body
+        assert "body_truncated" not in result
+
+    def test_invalid_env_var_defaults_to_no_truncation(self):
+        body = "x" * 500
+        with patch.dict(os.environ, {"GMAIL_MAX_BODY_CHARS": "not_a_number"}):
+            reset_config()
+            import gmail_mcp.server as srv
+            email_data = {"id": "abc", "body": body}
+            result = srv._apply_body_truncation(email_data)
+        assert result["body"] == body
+
+    def test_config_parses_max_body_chars(self):
+        with patch.dict(os.environ, {"GMAIL_MAX_BODY_CHARS": "5000"}):
+            cfg = GmailMCPConfig.from_env()
+        assert cfg.max_body_chars == 5000
+
+    def test_config_negative_clamped_to_zero(self):
+        with patch.dict(os.environ, {"GMAIL_MAX_BODY_CHARS": "-10"}):
+            cfg = GmailMCPConfig.from_env()
+        assert cfg.max_body_chars == 0
+
+
+# ---------------------------------------------------------------------------
+# Feature 14 – Regex pattern hot-reload from YAML config file
+# ---------------------------------------------------------------------------
+
+class TestCustomPatternHotReload:
+    """Custom block/redact patterns are loaded from a YAML file."""
+
+    def setup_method(self):
+        from gmail_mcp.security import reset_custom_patterns
+        reset_custom_patterns()
+
+    def teardown_method(self):
+        from gmail_mcp.security import reset_custom_patterns
+        reset_custom_patterns()
+
+    def _write_yaml(self, path, content: str):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+    def test_custom_block_pattern_blocks_text(self, tmp_path):
+        yaml_file = str(tmp_path / "patterns.yaml")
+        self._write_yaml(yaml_file, (
+            "block_patterns:\n"
+            "  - name: employee ID\n"
+            "    pattern: 'EMP-\\d{6}'\n"
+        ))
+        with patch.dict(os.environ, {"GMAIL_PATTERNS_FILE": yaml_file}):
+            from gmail_mcp.security import reset_custom_patterns
+            reset_custom_patterns()
+            result = scan_text("Please contact EMP-123456 for more info.")
+        assert result.level == SensitivityLevel.BLOCKED
+        assert any("employee ID" in r for r in result.reasons)
+
+    def test_custom_redact_pattern_redacts_text(self, tmp_path):
+        from gmail_mcp.security import redact_text, reset_custom_patterns
+        yaml_file = str(tmp_path / "patterns.yaml")
+        self._write_yaml(yaml_file, (
+            "redact_patterns:\n"
+            "  - name: account number\n"
+            "    pattern: 'ACC-\\d{8}'\n"
+            "    placeholder: '[ACCOUNT REDACTED]'\n"
+        ))
+        with patch.dict(os.environ, {"GMAIL_PATTERNS_FILE": yaml_file}):
+            reset_custom_patterns()
+            result = redact_text("Your ACC-12345678 has been updated.")
+        assert "[ACCOUNT REDACTED]" in result
+        assert "ACC-12345678" not in result
+
+    def test_patterns_not_applied_when_file_not_set(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_PATTERNS_FILE", None)
+            from gmail_mcp.security import reset_custom_patterns
+            reset_custom_patterns()
+            result = scan_text("EMP-999999 joined the company.")
+        # Without the custom pattern, this should not be blocked.
+        assert result.level == SensitivityLevel.NONE
+
+    def test_hot_reload_picks_up_file_change(self, tmp_path):
+        import time
+        from gmail_mcp.security import reset_custom_patterns
+        yaml_file = str(tmp_path / "patterns.yaml")
+        # First write: block EMP-XXXXXX
+        self._write_yaml(yaml_file, (
+            "block_patterns:\n"
+            "  - name: emp1\n"
+            "    pattern: 'EMP-\\d{6}'\n"
+        ))
+        with patch.dict(os.environ, {"GMAIL_PATTERNS_FILE": yaml_file}):
+            reset_custom_patterns()
+            r1 = scan_text("EMP-111111 joined")
+        assert r1.level == SensitivityLevel.BLOCKED
+
+        # Update file with a different pattern (ensure mtime changes)
+        time.sleep(0.05)
+        self._write_yaml(yaml_file, (
+            "block_patterns:\n"
+            "  - name: dept code\n"
+            "    pattern: 'DEPT-\\d{4}'\n"
+        ))
+        with patch.dict(os.environ, {"GMAIL_PATTERNS_FILE": yaml_file}):
+            r2 = scan_text("EMP-111111 joined")  # old pattern no longer applies
+            r3 = scan_text("DEPT-9999 is restricted")  # new pattern applies
+        assert r2.level == SensitivityLevel.NONE
+        assert r3.level == SensitivityLevel.BLOCKED
+
+    def test_config_parses_patterns_file(self, tmp_path):
+        yaml_file = str(tmp_path / "p.yaml")
+        with patch.dict(os.environ, {"GMAIL_PATTERNS_FILE": yaml_file}):
+            cfg = GmailMCPConfig.from_env()
+        assert cfg.patterns_file == yaml_file
+
+
+# ---------------------------------------------------------------------------
+# Feature 15 – Metadata-only mode
+# ---------------------------------------------------------------------------
+
+class TestMetadataOnlyMode:
+    """list_emails and search_emails strip body/snippet when metadata_only=True."""
+
+    def setup_method(self):
+        reset_config()
+        import gmail_mcp.server as srv
+        srv._client = None
+        srv._label_id_to_name = None
+
+    def teardown_method(self):
+        reset_config()
+        import gmail_mcp.server as srv
+        srv._client = None
+        srv._label_id_to_name = None
+
+    def _make_filtered_email(self, **kwargs):
+        from gmail_mcp.security import FilteredEmail, ScanResult
+        data = {
+            "id": "abc123",
+            "thread_id": "thread456",
+            "subject": "Test Subject",
+            "from": "alice@example.com",
+            "to": "bob@example.com",
+            "date": "Mon, 1 Jan 2024 00:00:00 +0000",
+            "snippet": "This is the snippet",
+            "body": "This is the full body of the email.",
+            "label_ids": ["INBOX"],
+        }
+        data.update(kwargs)
+        return FilteredEmail(data=data, scan=ScanResult())
+
+    def test_list_emails_metadata_only_strips_body_and_snippet(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_BLOCKED_LABELS", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            mock_client.list_emails.return_value = [self._make_filtered_email()]
+            srv._client = mock_client
+            srv._label_id_to_name = {}
+            results = srv.list_emails(max_results=1, metadata_only=True)
+        assert len(results) == 1
+        email = results[0]
+        assert "body" not in email
+        assert "snippet" not in email
+        assert email.get("subject") == "Test Subject"
+        assert email.get("from") == "alice@example.com"
+
+    def test_list_emails_metadata_only_includes_required_fields(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_BLOCKED_LABELS", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            mock_client.list_emails.return_value = [self._make_filtered_email()]
+            srv._client = mock_client
+            srv._label_id_to_name = {}
+            results = srv.list_emails(max_results=1, metadata_only=True)
+        email = results[0]
+        for key in ("id", "thread_id", "from", "subject", "date"):
+            assert key in email, f"Expected '{key}' in metadata-only response"
+
+    def test_list_emails_full_mode_includes_body(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_BLOCKED_LABELS", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            mock_client.list_emails.return_value = [self._make_filtered_email()]
+            srv._client = mock_client
+            srv._label_id_to_name = {}
+            results = srv.list_emails(max_results=1, metadata_only=False)
+        email = results[0]
+        assert "body" in email
+
+    def test_search_emails_metadata_only_strips_body(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_BLOCKED_LABELS", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            mock_client.search_emails.return_value = [self._make_filtered_email()]
+            srv._client = mock_client
+            srv._label_id_to_name = {}
+            results = srv.search_emails(query="test", max_results=1, metadata_only=True)
+        assert len(results) == 1
+        email = results[0]
+        assert "body" not in email
+        assert "snippet" not in email
+
+    def test_search_emails_full_mode_includes_body(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_BLOCKED_LABELS", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            mock_client.search_emails.return_value = [self._make_filtered_email()]
+            srv._client = mock_client
+            srv._label_id_to_name = {}
+            results = srv.search_emails(query="test", max_results=1, metadata_only=False)
+        email = results[0]
+        assert "body" in email
+
+    def test_metadata_only_default_is_false(self):
+        """Calling list_emails without metadata_only should behave as full mode."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_BLOCKED_LABELS", None)
+            import gmail_mcp.server as srv
+            mock_client = MagicMock()
+            mock_client.list_emails.return_value = [self._make_filtered_email()]
+            srv._client = mock_client
+            srv._label_id_to_name = {}
+            results = srv.list_emails(max_results=1)
+        assert "body" in results[0]

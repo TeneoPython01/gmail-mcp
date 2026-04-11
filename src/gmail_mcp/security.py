@@ -13,18 +13,36 @@ Patterns covered:
   - API keys, bearer tokens, private keys / certificates
   - Prompt-injection attempts (instruction overrides, persona hijacking, jailbreaks)
   - Other Sensitive Personal Information (SPI) markers
+  - Custom user-defined patterns loaded from a YAML file (Feature 14)
 
 Attachment filtering:
   The same pattern engine is applied to extracted text from email attachments
   (plain text, PDF, DOCX) to catch credentials, PII, or SPI embedded in files.
+
+Custom pattern hot-reload (Feature 14):
+  Set the ``GMAIL_PATTERNS_FILE`` environment variable to the path of a YAML
+  file.  The file is re-read automatically whenever its modification time
+  changes, so patterns can be updated without restarting the server.
+
+  Expected YAML structure::
+
+      block_patterns:
+        - name: "employee ID"
+          pattern: "EMP-\\d{6}"
+
+      redact_patterns:
+        - name: "internal account number"
+          pattern: "ACC-\\d{8}"
+          placeholder: "[ACCOUNT REDACTED]"
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +217,73 @@ _BLOCK_SUBJECT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 
 # ---------------------------------------------------------------------------
+# Feature 14 – Custom pattern hot-reload from YAML config file
+# ---------------------------------------------------------------------------
+
+# Sentinel value meaning "no file has been loaded yet".
+_CUSTOM_PATTERNS_MTIME: float | None = None
+_CUSTOM_BLOCK_PATTERNS: list[tuple[str, re.Pattern[str]]] = []
+_CUSTOM_REDACT_PATTERNS: list[tuple[str, re.Pattern[str], str]] = []
+
+
+def _reload_custom_patterns_if_needed() -> None:
+    """Reload custom patterns from the YAML file if its mtime has changed."""
+    global _CUSTOM_PATTERNS_MTIME, _CUSTOM_BLOCK_PATTERNS, _CUSTOM_REDACT_PATTERNS
+
+    path = os.environ.get("GMAIL_PATTERNS_FILE", "").strip()
+    if not path:
+        # No patterns file configured; clear any previously loaded patterns.
+        if _CUSTOM_PATTERNS_MTIME is not None:
+            _CUSTOM_PATTERNS_MTIME = None
+            _CUSTOM_BLOCK_PATTERNS = []
+            _CUSTOM_REDACT_PATTERNS = []
+        return
+
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return  # File not accessible; keep previous patterns.
+
+    if mtime == _CUSTOM_PATTERNS_MTIME:
+        return  # File unchanged; nothing to do.
+
+    # File is new or has changed – load it.
+    try:
+        import yaml  # type: ignore[import-untyped]
+        with open(path, encoding="utf-8") as fh:
+            data: Any = yaml.safe_load(fh) or {}
+    except Exception:
+        return  # Parse error; keep previous patterns.
+
+    new_block: list[tuple[str, re.Pattern[str]]] = []
+    for entry in data.get("block_patterns", []):
+        name = str(entry.get("name", "custom block pattern"))
+        pattern_str = str(entry.get("pattern", ""))
+        if not pattern_str:
+            continue
+        try:
+            new_block.append((name, re.compile(pattern_str, re.IGNORECASE)))
+        except re.error:
+            pass
+
+    new_redact: list[tuple[str, re.Pattern[str], str]] = []
+    for entry in data.get("redact_patterns", []):
+        name = str(entry.get("name", "custom redact pattern"))
+        pattern_str = str(entry.get("pattern", ""))
+        placeholder = str(entry.get("placeholder", "[REDACTED]"))
+        if not pattern_str:
+            continue
+        try:
+            new_redact.append((name, re.compile(pattern_str, re.IGNORECASE), placeholder))
+        except re.error:
+            pass
+
+    _CUSTOM_BLOCK_PATTERNS = new_block
+    _CUSTOM_REDACT_PATTERNS = new_redact
+    _CUSTOM_PATTERNS_MTIME = mtime
+
+
+# ---------------------------------------------------------------------------
 # Core scanning logic
 # ---------------------------------------------------------------------------
 
@@ -206,16 +291,18 @@ def scan_text(text: str) -> ScanResult:
     """Scan *text* for sensitive patterns and return a :class:`ScanResult`.
 
     This is the low-level checker; callers typically use :func:`filter_email`.
+    Custom patterns (Feature 14) are applied in addition to the built-in ones.
     """
+    _reload_custom_patterns_if_needed()
     result = ScanResult()
 
-    for reason, pattern in _BLOCK_PATTERNS:
+    for reason, pattern in _BLOCK_PATTERNS + _CUSTOM_BLOCK_PATTERNS:
         if pattern.search(text):
             result.level = SensitivityLevel.BLOCKED
             result.reasons.append(reason)
 
     if result.level != SensitivityLevel.BLOCKED:
-        for reason, pattern, _placeholder in _REDACT_PATTERNS:
+        for reason, pattern, _placeholder in _REDACT_PATTERNS + _CUSTOM_REDACT_PATTERNS:
             if pattern.search(text):
                 if result.level == SensitivityLevel.NONE:
                     result.level = SensitivityLevel.REDACTED
@@ -225,8 +312,12 @@ def scan_text(text: str) -> ScanResult:
 
 
 def redact_text(text: str) -> str:
-    """Return a copy of *text* with all sensitive patterns replaced by placeholders."""
-    for _reason, pattern, placeholder in _REDACT_PATTERNS:
+    """Return a copy of *text* with all sensitive patterns replaced by placeholders.
+
+    Both built-in and custom patterns (Feature 14) are applied.
+    """
+    _reload_custom_patterns_if_needed()
+    for _reason, pattern, placeholder in _REDACT_PATTERNS + _CUSTOM_REDACT_PATTERNS:
         text = pattern.sub(placeholder, text)
     return text
 
@@ -335,7 +426,7 @@ def filter_email(email: dict) -> FilteredEmail:
 
     # Rebuild scan result based on what was actually changed.
     reasons: list[str] = []
-    for reason, pattern, _ph in _REDACT_PATTERNS:
+    for reason, pattern, _ph in _REDACT_PATTERNS + _CUSTOM_REDACT_PATTERNS:
         if pattern.search(body) or pattern.search(snippet):
             reasons.append(reason)
 
@@ -398,3 +489,11 @@ def _blocked_notice(email: dict, scan: ScanResult) -> dict:
         "security_filtered": True,
         "security_reasons": scan.reasons,
     }
+
+
+def reset_custom_patterns() -> None:
+    """Reset the custom-pattern cache (used in tests to re-initialise state)."""
+    global _CUSTOM_PATTERNS_MTIME, _CUSTOM_BLOCK_PATTERNS, _CUSTOM_REDACT_PATTERNS
+    _CUSTOM_PATTERNS_MTIME = None
+    _CUSTOM_BLOCK_PATTERNS = []
+    _CUSTOM_REDACT_PATTERNS = []
