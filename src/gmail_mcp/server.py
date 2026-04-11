@@ -29,6 +29,17 @@ Security features
   ``GMAIL_REQUIRE_CONFIRMATION=true`` so that write operations return a
   pending-action object instead of executing immediately.  Call
   ``confirm_action`` with the returned ``pending_action_id`` to proceed.
+* **Outbound content scanning** (Feature 8): the body of every outgoing email
+  is scanned for sensitive content before it is sent (or queued).
+* **Audit logging** (Feature 10): set ``GMAIL_AUDIT_LOG`` to a file path to
+  enable append-only, tamper-evident logging of every tool call.
+* **Body truncation** (Feature 13): set ``GMAIL_MAX_BODY_CHARS`` to cap the
+  number of characters returned from any single email body.
+* **Custom pattern hot-reload** (Feature 14): set ``GMAIL_PATTERNS_FILE`` to
+  a YAML file containing additional block/redact patterns.
+* **Metadata-only mode** (Feature 15): pass ``metadata_only=True`` to
+  ``list_emails`` or ``search_emails`` to receive only sender, subject, date,
+  and thread ID—never the body or snippet.
 """
 
 from __future__ import annotations
@@ -40,9 +51,10 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from .audit import get_audit_logger
 from .config import get_config
 from .gmail_client import GmailClient
-from .security import SensitivityLevel
+from .security import SensitivityLevel, scan_text
 
 # ---------------------------------------------------------------------------
 # MCP server instance
@@ -182,6 +194,58 @@ def _format_email(fe_data: dict) -> dict[str, Any]:
     return {k: v for k, v in display.items() if v not in ("", [], None)}
 
 
+def _apply_body_truncation(email_data: dict) -> dict:
+    """Truncate the email body if it exceeds the configured limit (Feature 13).
+
+    When truncation occurs a notice is appended so the LLM knows the body is
+    incomplete.
+    """
+    config = get_config()
+    limit = config.max_body_chars
+    if limit <= 0:
+        return email_data
+
+    body = email_data.get("body", "") or ""
+    if len(body) > limit:
+        truncated = email_data.copy()
+        truncated["body"] = (
+            body[:limit]
+            + f"\n\n[EMAIL BODY TRUNCATED: showing first {limit} of {len(body)} characters]"
+        )
+        truncated["body_truncated"] = True
+        return truncated
+    return email_data
+
+
+def _check_outbound_body(body: str) -> dict | None:
+    """Return an error dict if *body* contains sensitive content (Feature 8).
+
+    Both block-level and redact-level patterns are checked: the LLM must not
+    forward any sensitive information it may have reconstructed from context.
+    """
+    if not body:
+        return None
+    result = scan_text(body)
+    if result.level in (SensitivityLevel.BLOCKED, SensitivityLevel.REDACTED):
+        return {
+            "error": (
+                "Outbound email blocked: the body contains sensitive content "
+                f"({', '.join(result.reasons)}). "
+                "Please review and remove sensitive information before sending."
+            ),
+            "security_filtered": True,
+            "security_reasons": result.reasons,
+        }
+    return None
+
+
+def _audit(tool: str, params: dict[str, Any], result: str, reasons: list[str] | None = None) -> None:
+    """Write one entry to the audit log if logging is enabled (Feature 10)."""
+    logger = get_audit_logger()
+    if logger is not None:
+        logger.log(tool=tool, params=params, result=result, reasons=reasons)
+
+
 # ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
@@ -191,6 +255,7 @@ def list_emails(
     max_results: int = 10,
     query: str = "",
     label: str = "INBOX",
+    metadata_only: bool = False,
 ) -> list[dict]:
     """List emails from the user's Gmail account.
 
@@ -199,12 +264,19 @@ def list_emails(
         query: Optional Gmail search query (e.g. "from:alice newer_than:7d").
         label: Gmail label to filter by (default "INBOX").
                 Use "SENT" for sent mail, "SPAM" for spam, etc.
+        metadata_only: When True, return only sender, subject, date, and
+                thread ID — never the body or snippet (Feature 15).  Use this
+                to browse at scale and then fetch individual emails in full.
 
     Returns:
         A list of email objects.  Emails containing sensitive information are
         automatically redacted or replaced with a security notice.  Emails
         carrying a restricted label are blocked outright.
     """
+    params: dict[str, Any] = {
+        "max_results": max_results, "query": query, "label": label,
+        "metadata_only": metadata_only,
+    }
     client = _get_client()
     label_ids = [label.upper()] if label else ["INBOX"]
     filtered_emails = client.list_emails(
@@ -215,7 +287,16 @@ def list_emails(
     results = []
     for fe in filtered_emails:
         blocked = _check_label_access(fe.data)
-        results.append(_format_email(blocked if blocked is not None else fe.data))
+        email_data = blocked if blocked is not None else fe.data
+        if metadata_only:
+            email_data = {
+                k: email_data.get(k, "")
+                for k in ("id", "thread_id", "from", "subject", "date")
+            }
+        else:
+            email_data = _apply_body_truncation(email_data)
+        results.append(_format_email(email_data))
+    _audit("list_emails", params, "ok")
     return results
 
 
@@ -231,16 +312,23 @@ def get_email(email_id: str) -> dict:
         redacted or replaced with a security notice.  If the email carries a
         restricted label it is blocked outright.
     """
+    params: dict[str, Any] = {"email_id": email_id}
     client = _get_client()
     fe = client.get_email(email_id)
     blocked = _check_label_access(fe.data)
-    return _format_email(blocked if blocked is not None else fe.data)
+    email_data = blocked if blocked is not None else fe.data
+    result_str = "blocked" if email_data.get("security_filtered") else "ok"
+    reasons = email_data.get("security_reasons") if email_data.get("security_filtered") else None
+    email_data = _apply_body_truncation(email_data)
+    _audit("get_email", params, result_str, reasons)
+    return _format_email(email_data)
 
 
 @mcp.tool()
 def search_emails(
     query: str,
     max_results: int = 10,
+    metadata_only: bool = False,
 ) -> list[dict]:
     """Search emails using Gmail's query syntax.
 
@@ -259,17 +347,31 @@ def search_emails(
     Args:
         query: Gmail search query string.
         max_results: Maximum number of results to return (1–100, default 10).
+        metadata_only: When True, return only sender, subject, date, and
+                thread ID — never the body or snippet (Feature 15).
 
     Returns:
         A list of matching email objects, security-filtered.  Emails carrying
         a restricted label are blocked outright.
     """
+    params: dict[str, Any] = {
+        "query": query, "max_results": max_results, "metadata_only": metadata_only,
+    }
     client = _get_client()
     filtered_emails = client.search_emails(query=query, max_results=max_results)
     results = []
     for fe in filtered_emails:
         blocked = _check_label_access(fe.data)
-        results.append(_format_email(blocked if blocked is not None else fe.data))
+        email_data = blocked if blocked is not None else fe.data
+        if metadata_only:
+            email_data = {
+                k: email_data.get(k, "")
+                for k in ("id", "thread_id", "from", "subject", "date")
+            }
+        else:
+            email_data = _apply_body_truncation(email_data)
+        results.append(_format_email(email_data))
+    _audit("search_emails", params, "ok")
     return results
 
 
@@ -292,19 +394,30 @@ def send_email(
 
     Returns:
         A dict containing the ``id`` and ``thread_id`` of the sent message, or
-        a ``pending_action_id`` dict when confirmation-required mode is enabled.
+        a ``pending_action_id`` dict when confirmation-required mode is enabled,
+        or an error dict if the body contains sensitive content.
     """
-    err = _check_tool_enabled("send_email")
-    if err is not None:
-        return err
-    config = get_config()
     params: dict[str, Any] = {
         "to": to, "subject": subject, "body": body, "cc": cc, "bcc": bcc,
     }
+    err = _check_tool_enabled("send_email")
+    if err is not None:
+        _audit("send_email", params, "error")
+        return err
+    # Feature 8: scan outbound body for sensitive content.
+    outbound_err = _check_outbound_body(body)
+    if outbound_err is not None:
+        _audit("send_email", params, "blocked", outbound_err.get("security_reasons"))
+        return outbound_err
+    config = get_config()
     if config.require_confirmation:
-        return _create_pending_action("send_email", params)
+        result = _create_pending_action("send_email", params)
+        _audit("send_email", params, "pending")
+        return result
     client = _get_client()
-    return client.send_email(**params)
+    result = client.send_email(**params)
+    _audit("send_email", params, "ok")
+    return result
 
 
 @mcp.tool()
@@ -320,17 +433,28 @@ def reply_to_email(email_id: str, body: str) -> dict:
 
     Returns:
         A dict containing the ``id`` and ``thread_id`` of the sent reply, or
-        a ``pending_action_id`` dict when confirmation-required mode is enabled.
+        a ``pending_action_id`` dict when confirmation-required mode is enabled,
+        or an error dict if the body contains sensitive content.
     """
+    params: dict[str, Any] = {"email_id": email_id, "body": body}
     err = _check_tool_enabled("reply_to_email")
     if err is not None:
+        _audit("reply_to_email", params, "error")
         return err
+    # Feature 8: scan outbound body for sensitive content.
+    outbound_err = _check_outbound_body(body)
+    if outbound_err is not None:
+        _audit("reply_to_email", params, "blocked", outbound_err.get("security_reasons"))
+        return outbound_err
     config = get_config()
-    params: dict[str, Any] = {"email_id": email_id, "body": body}
     if config.require_confirmation:
-        return _create_pending_action("reply_to_email", params)
+        result = _create_pending_action("reply_to_email", params)
+        _audit("reply_to_email", params, "pending")
+        return result
     client = _get_client()
-    return client.reply_to_email(**params)
+    result = client.reply_to_email(**params)
+    _audit("reply_to_email", params, "ok")
+    return result
 
 
 @mcp.tool()
@@ -344,14 +468,19 @@ def mark_as_read(email_id: str) -> dict:
         A confirmation dict, or a ``pending_action_id`` dict when
         confirmation-required mode is enabled.
     """
+    params: dict[str, Any] = {"email_id": email_id}
     err = _check_tool_enabled("mark_as_read")
     if err is not None:
+        _audit("mark_as_read", params, "error")
         return err
     config = get_config()
     if config.require_confirmation:
-        return _create_pending_action("mark_as_read", {"email_id": email_id})
+        result = _create_pending_action("mark_as_read", params)
+        _audit("mark_as_read", params, "pending")
+        return result
     client = _get_client()
     client.mark_as_read(email_id)
+    _audit("mark_as_read", params, "ok")
     return {"status": "ok", "email_id": email_id, "action": "marked_as_read"}
 
 
@@ -366,14 +495,19 @@ def mark_as_unread(email_id: str) -> dict:
         A confirmation dict, or a ``pending_action_id`` dict when
         confirmation-required mode is enabled.
     """
+    params: dict[str, Any] = {"email_id": email_id}
     err = _check_tool_enabled("mark_as_unread")
     if err is not None:
+        _audit("mark_as_unread", params, "error")
         return err
     config = get_config()
     if config.require_confirmation:
-        return _create_pending_action("mark_as_unread", {"email_id": email_id})
+        result = _create_pending_action("mark_as_unread", params)
+        _audit("mark_as_unread", params, "pending")
+        return result
     client = _get_client()
     client.mark_as_unread(email_id)
+    _audit("mark_as_unread", params, "ok")
     return {"status": "ok", "email_id": email_id, "action": "marked_as_unread"}
 
 
@@ -388,14 +522,19 @@ def archive_email(email_id: str) -> dict:
         A confirmation dict, or a ``pending_action_id`` dict when
         confirmation-required mode is enabled.
     """
+    params: dict[str, Any] = {"email_id": email_id}
     err = _check_tool_enabled("archive_email")
     if err is not None:
+        _audit("archive_email", params, "error")
         return err
     config = get_config()
     if config.require_confirmation:
-        return _create_pending_action("archive_email", {"email_id": email_id})
+        result = _create_pending_action("archive_email", params)
+        _audit("archive_email", params, "pending")
+        return result
     client = _get_client()
     client.archive_email(email_id)
+    _audit("archive_email", params, "ok")
     return {"status": "ok", "email_id": email_id, "action": "archived"}
 
 
@@ -410,14 +549,19 @@ def trash_email(email_id: str) -> dict:
         A confirmation dict, or a ``pending_action_id`` dict when
         confirmation-required mode is enabled.
     """
+    params: dict[str, Any] = {"email_id": email_id}
     err = _check_tool_enabled("trash_email")
     if err is not None:
+        _audit("trash_email", params, "error")
         return err
     config = get_config()
     if config.require_confirmation:
-        return _create_pending_action("trash_email", {"email_id": email_id})
+        result = _create_pending_action("trash_email", params)
+        _audit("trash_email", params, "pending")
+        return result
     client = _get_client()
     client.trash_email(email_id)
+    _audit("trash_email", params, "ok")
     return {"status": "ok", "email_id": email_id, "action": "trashed"}
 
 
@@ -437,8 +581,10 @@ def confirm_action(action_id: str) -> dict:
         The result of the original write operation, or an error dict if the
         action ID is unknown or has already been executed / discarded.
     """
+    params: dict[str, Any] = {"action_id": action_id}
     action = _pending_actions.pop(action_id, None)
     if action is None:
+        _audit("confirm_action", params, "error")
         return {
             "error": (
                 f"No pending action with id '{action_id}'.  "
@@ -447,13 +593,28 @@ def confirm_action(action_id: str) -> dict:
         }
 
     tool_name = action["tool"]
-    params: dict[str, Any] = action["params"]
+    action_params: dict[str, Any] = action["params"]
     client = _get_client()
 
     if tool_name == "send_email":
-        return client.send_email(**params)
+        # Feature 8: re-scan outbound body at execution time.
+        outbound_err = _check_outbound_body(action_params.get("body", ""))
+        if outbound_err is not None:
+            _audit("confirm_action", params, "blocked", outbound_err.get("security_reasons"))
+            return outbound_err
+        result = client.send_email(**action_params)
+        _audit("confirm_action", params, "ok")
+        return result
+
     if tool_name == "reply_to_email":
-        return client.reply_to_email(**params)
+        # Feature 8: re-scan outbound body at execution time.
+        outbound_err = _check_outbound_body(action_params.get("body", ""))
+        if outbound_err is not None:
+            _audit("confirm_action", params, "blocked", outbound_err.get("security_reasons"))
+            return outbound_err
+        result = client.reply_to_email(**action_params)
+        _audit("confirm_action", params, "ok")
+        return result
 
     # Label-modifying / state-changing single-message operations share the
     # same response shape: {status, email_id, action}.
@@ -465,9 +626,11 @@ def confirm_action(action_id: str) -> dict:
     }
     if tool_name in _LABEL_OPS:
         method, action_label = _LABEL_OPS[tool_name]
-        method(params["email_id"])
-        return {"status": "ok", "email_id": params["email_id"], "action": action_label}
+        method(action_params["email_id"])
+        _audit("confirm_action", params, "ok")
+        return {"status": "ok", "email_id": action_params["email_id"], "action": action_label}
 
+    _audit("confirm_action", params, "error")
     return {"error": f"Unknown pending action type: '{tool_name}'."}
 
 
