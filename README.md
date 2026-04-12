@@ -25,33 +25,133 @@ An MCP (Model Context Protocol) server that lets agentic AI assistants read, man
 
 ## Setup
 
-### 1. Enable Gmail API and create credentials
+Follow these steps in order to get the server running from scratch.
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/).
-2. Create a new project (or select an existing one).
-3. Enable the **Gmail API** for the project.
-4. Go to **APIs & Services → Credentials** and create an **OAuth 2.0 Client ID** (Application type: *Desktop app*).
-5. Download the credential file and save it as `credentials.json` in the root of this project.
+---
 
-> **Important:** `credentials.json` and `token.json` are listed in `.gitignore` and must **never** be committed to the repository.
+### Step 1 – Prerequisites
 
-### 2. Install dependencies
+Make sure the following are installed before you begin:
+
+| Requirement | Minimum version | Check |
+|---|---|---|
+| Python | 3.10 | `python --version` |
+| pip | bundled with Python | `pip --version` |
+| git | any recent version | `git --version` |
+
+You also need a **Google account** whose Gmail inbox you want to connect.
+
+---
+
+### Step 2 – Clone the repository
+
+```bash
+git clone https://github.com/TeneoPython01/gmail-mcp.git
+cd gmail-mcp
+```
+
+---
+
+### Step 3 – Install dependencies
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-### 3. Authenticate (first run)
+This installs the `gmail-mcp` CLI entry-point and all runtime + development dependencies.
 
-On the first run, the server opens a browser window for Google OAuth consent. Once you authorise access, a `token.json` file is written locally and reused for subsequent runs.
+---
+
+### Step 4 – Create a Google Cloud project and enable the Gmail API
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/) and sign in.
+2. Click the project selector at the top of the page, then click **New Project**.
+   - Enter a project name (e.g. `gmail-mcp`) and click **Create**.
+3. Make sure your new project is selected in the project selector.
+4. In the left navigation menu go to **APIs & Services → Library**.
+5. Search for **Gmail API** and click on it, then click **Enable**.
+
+---
+
+### Step 5 – Configure the OAuth consent screen
+
+> This step is required before you can create OAuth credentials.
+
+1. Go to **APIs & Services → OAuth consent screen**.
+2. Select **External** as the user type (or **Internal** if you are on Google Workspace and only want organisational accounts to use it), then click **Create**.
+3. Fill in the required fields:
+   - **App name** – e.g. `Gmail MCP`
+   - **User support email** – your Google account email
+   - **Developer contact email** – your Google account email
+4. Click **Save and Continue** through the **Scopes** and **Test users** screens (you can leave them at their defaults for now).
+5. On the **Summary** screen click **Back to Dashboard**.
+6. While the app is in *Testing* status, only accounts you add as test users can authenticate.  Click **+ Add Users** on the **OAuth consent screen** page and add your own Google account email.
+
+---
+
+### Step 6 – Create OAuth 2.0 credentials
+
+1. Go to **APIs & Services → Credentials**.
+2. Click **+ Create Credentials → OAuth client ID**.
+3. Set **Application type** to **Desktop app**.
+4. Give it a name (e.g. `gmail-mcp-desktop`) and click **Create**.
+5. A dialog shows your client ID and secret — click **Download JSON**.
+6. Rename the downloaded file to `credentials.json` and place it in the **root of this repository** (the same folder as `pyproject.toml`).
+
+> **Important:** `credentials.json` and `token.json` are listed in `.gitignore` and must **never** be committed to the repository.
+
+---
+
+### Step 7 – Authenticate (first run)
+
+Run the auth helper. It opens a browser window for the Google OAuth consent flow. Select your Google account, grant the requested permissions, and the browser will confirm that authentication was successful.
 
 ```bash
 gmail-mcp --auth
 ```
 
-### 4. Configure your MCP client
+A `token.json` file is written to the project root and reused automatically for all subsequent runs. You only need to repeat this step if you delete `token.json` or if the token is revoked.
 
-Add the server to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config.json`):
+---
+
+### Step 8 – (Optional) Configure environment variables
+
+All runtime options are controlled through environment variables. You can set them in your shell or in a `.env` file in the project root (the server uses `python-dotenv` to load it automatically).
+
+**Example `.env` file:**
+
+```dotenv
+# Restrict which Gmail labels the LLM can access
+GMAIL_BLOCKED_LABELS=finance,medical
+
+# Disable destructive tools you don't need
+GMAIL_DISABLED_TOOLS=trash_email
+
+# Require explicit confirmation before any write operation executes
+GMAIL_REQUIRE_CONFIRMATION=true
+
+# Enable append-only audit logging
+GMAIL_AUDIT_LOG=/path/to/audit.jsonl
+
+# Truncate email bodies longer than this many characters (0 = no limit)
+GMAIL_MAX_BODY_CHARS=10000
+
+# Path to a YAML file with custom block/redact patterns (hot-reloaded)
+GMAIL_PATTERNS_FILE=/path/to/patterns.yaml
+```
+
+See the [Configuration](#configuration) section below for the full list of options.
+
+---
+
+### Step 9 – Connect to your MCP client
+
+#### Claude Desktop
+
+Add the server to your Claude Desktop config file.
+
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
 ```json
 {
@@ -64,10 +164,30 @@ Add the server to your MCP client configuration (e.g. Claude Desktop `claude_des
 }
 ```
 
-Or run it directly:
+Restart Claude Desktop. You should see a 🔨 (tools) icon in the chat input bar indicating the Gmail tools are available.
+
+#### Other MCP clients
+
+Consult your client's documentation for how to register a stdio MCP server. The command to run is simply:
 
 ```bash
 gmail-mcp
+```
+
+---
+
+### Step 10 – Verify the setup
+
+Start the server manually to confirm everything is working:
+
+```bash
+gmail-mcp
+```
+
+If authentication is valid and the Gmail API is reachable the server starts silently and waits for MCP requests. You can also run the test suite:
+
+```bash
+pytest
 ```
 
 ## Configuration
