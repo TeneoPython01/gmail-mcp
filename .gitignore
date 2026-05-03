@@ -61,3 +61,6 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+credentials.json
+token.json
